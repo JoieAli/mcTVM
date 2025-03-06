@@ -44,8 +44,6 @@ from tvm.tir.tensor_intrin.cuda import (
     MMA_fill_16x16_i32_INTRIN,
     MMA_i8i8i32_INTRIN,
     MMA_i8i8i32_TRANS_B_INTRIN,
-    MMA_e5m2e5m2f32_TRANS_B_INTRIN,
-    MMA_e4m3e4m3f32_TRANS_B_INTRIN,
     MMA_store_16x16_f16_global_INTRIN,
     MMA_store_16x16_f32_global_INTRIN,
     MMA_store_16x16_i32_global_INTRIN,

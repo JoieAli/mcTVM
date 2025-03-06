@@ -846,7 +846,7 @@ def test_copy(dtype, vec_len):
 
 
 @tvm.testing.requires_cuda_compute_version(8, 9)
-@pytest.mark.parametrize("dtype", ["e5m2_float8", "e4m3_float8"])
+@pytest.mark.parametrize("dtype", ["float8_e5m2", "float8_e4m3fn"])
 @pytest.mark.parametrize("vec_len", [2, 4, 8, 16])
 def test_copy(dtype, vec_len):
     @T.prim_func
@@ -1025,4 +1025,5 @@ def test_fp8_fp16_bf16_vectorize_arith():
 
 
 if __name__ == "__main__":
+    # test_half_broadcast(6)
     tvm.testing.main()
