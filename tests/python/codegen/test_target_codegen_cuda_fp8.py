@@ -1025,5 +1025,4 @@ def test_fp8_fp16_bf16_vectorize_arith():
 
 
 if __name__ == "__main__":
-    # test_half_broadcast(6)
     tvm.testing.main()
