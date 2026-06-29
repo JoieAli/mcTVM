@@ -25,8 +25,9 @@
 #define TVM_TARGET_SOURCE_CODEGEN_MACA_H_
 
 #include <tvm/target/codegen.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
+#include <tvm/ffi/error.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
 
 #include <queue>
 #include <string>
@@ -48,13 +49,13 @@ class VisitPipelineCommitQueueScope : public StmtExprVisitor {
   void VisitExpr_(const CallNode* op) final { StmtExprVisitor::VisitExpr_(op); }
   void VisitStmt_(const AttrStmtNode* op) final {
     mxc_cp_async_calls.clear();
-    if (op->attr_key == tir::attr::async_commit_queue_scope) {
+    if (op->attr_key == tirx::attr::async_commit_queue_scope) {
       this->VisitStmt(op->body);
     }
     if (!mxc_cp_async_calls.empty()) {
       this->total_cp_async_nums.push(mxc_cp_async_calls.size());
-      size_t last_cp_size = Downcast<IntImm>(mxc_cp_async_calls.back()->args[4])->value;
-      ICHECK(last_cp_size == 4 || last_cp_size == 8 || last_cp_size == 16)
+      size_t last_cp_size = mxc_cp_async_calls.back()->args[4].as_or_throw<IntImm>()->value;
+      TVM_FFI_ICHECK(last_cp_size == 4 || last_cp_size == 8 || last_cp_size == 16)
           << "For MACA, the size of an memcpy_async must be 4/8/16.";
       this->last_cp_async_size.push(last_cp_size);
     }
@@ -81,16 +82,19 @@ class CodeGenMACA final : public CodeGenC {
   void VisitStmt_(const ForNode* op) final;
   void PrintStorageSync(const CallNode* op) final;
   void PrintStorageScope(const std::string& scope, std::ostream& os) final;  // NOLINT(*)
-  void PrintVecBinaryOp(const std::string& op, DataType t, PrimExpr lhs, PrimExpr rhs,
+  using CodeGenC::PrintType;
+  void PrintVecBinaryOp(const std::string& op, const PrimType& t, PrimExpr lhs, PrimExpr rhs,
                         std::ostream& os) final;       // NOLINT(*)
-  void PrintType(DataType t, std::ostream& os) final;  // NOLINT(*)
-  void PrintVecConstructor(DataType t, std::ostream& os) final;
-  void PrintVecElemLoad(const std::string& vec, DataType t, int i,
+  void PrintType(const PrimType& t, std::ostream& os) final;  // NOLINT(*)
+  void PrintVecConstructor(const PrimType& t, std::ostream& os) final;
+  void PrintVecElemLoad(const std::string& vec, const PrimType& t, int i,
                         std::ostream& os) final;  // NOLINT(*)
-  void PrintVecElemStore(const std::string& vec, DataType t, int i, const std::string& value) final;
+  void PrintVecElemStore(const std::string& vec, const PrimType& t, int i,
+                         const std::string& value) final;
   void BindThreadIndex(const IterVar& iv) final;  // NOLINT(*)
-  void PrintVecElemLoadExpr(DataType t, int i, const std::string& value, std::ostream& os) final;
-  std::string CastFromTo(std::string value, DataType from, DataType target) final;
+  void PrintVecElemLoadExpr(const PrimType& t, int i, const std::string& value,
+                            std::ostream& os) final;
+  std::string CastFromTo(std::string value, const PrimType& from, const PrimType& target) final;
   // overload visitor
   void VisitExpr_(const RampNode* op, std::ostream& os) final;       // NOLINT(*)
   void VisitExpr_(const SelectNode* op, std::ostream& os) final;     // NOLINT(*)
@@ -99,7 +103,7 @@ class CodeGenMACA final : public CodeGenC {
   void VisitExpr_(const CallNode* op, std::ostream& os) final;
   void VisitExpr_(const CastNode* op, std::ostream& os) final;
   void VisitStmt_(const EvaluateNode* op) final;
-  void VisitStmt_(const AllocateNode* op) final;
+  void VisitStmt_(const AllocBufferNode* op) final;
   void VisitStmt_(const AttrStmtNode* op) final;
   void VisitStmt_(const DeclBufferNode* op) final;
 
@@ -151,7 +155,7 @@ class CodeGenMACA final : public CodeGenC {
   std::unordered_map<const VarNode*, std::string> fragment_shapes;
   std::unordered_map<const VarNode*, std::string> fragment_layouts;
   friend void PrintConst(const FloatImmNode* op, std::ostream& os, CodeGenMACA* p);
-  void PrintWmmaScope(const std::string& scope, DataType t, const VarNode* variable,
+  void PrintWmmaScope(const std::string& scope, const PrimType& t, const VarNode* variable,
                       std::ostream& os);
   int32_t GetWmmaFragmentSize(const std::string& scope, const VarNode* variable, int32_t size);
 

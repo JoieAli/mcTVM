@@ -25,8 +25,9 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
-#include <tvm/tir/index_map.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/runtime/logging.h>
+#include <tvm/tirx/index_map.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include <algorithm>
 #include <cmath>
@@ -34,12 +35,43 @@
 #include <utility>
 #include <vector>
 
-#include "../../tir/transforms/ir_utils.h"
-#include "literal/maca_half_t.h"
+#include "../../tirx/transform/ir_utils.h"
+#include "../../backend/cuda/codegen/literal/maca_half_t.h"
 
 namespace tvm {
 namespace codegen {
 namespace maca {
+
+namespace {
+
+bool IsFloat8(const PrimType& type) {
+  return type.MatchesCode(DLDataTypeCode::kDLFloat8_e4m3fn, DLDataTypeCode::kDLFloat8_e5m2);
+}
+
+bool IsFloat16(const PrimType& type) {
+  return type.MatchesElementType(DLDataTypeCode::kDLFloat, 16);
+}
+
+bool IsBFloat16(const PrimType& type) {
+  return type.MatchesElementType(DLDataTypeCode::kDLBfloat, 16);
+}
+
+bool IsIntOrUInt(const PrimType& type) {
+  return type.MatchesCode(DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt);
+}
+
+bool IsInt(const PrimType& type) { return type.MatchesCode(DLDataTypeCode::kDLInt); }
+
+bool IsUInt(const PrimType& type) { return type.MatchesCode(DLDataTypeCode::kDLUInt); }
+
+bool IsFloat(const PrimType& type) { return type.MatchesCode(DLDataTypeCode::kDLFloat); }
+
+bool IsVectorBool(const PrimType& type) {
+  return type.MatchesCode(DLDataTypeCode::kDLBool) && type.IsFixedLengthVector();
+}
+
+}  // namespace
+
 /*!
  * \brief Replace patterns with replacement strings.
  * \note should use std::format instead when codebase is ported to C++20.
@@ -114,11 +146,11 @@ std::string PrintPredicatedMemcpyAsyncAssembly(const std::string& ret_var,
   return code;
 }
 
-std::string GetFP8Type(DataType type) {
+std::string GetFP8Type(const PrimType& type) {
   std::stringstream stream;
   int32_t lanes = type.lanes();
   std::string vec;
-  if (type.is_scalar()) {
+  if (type.IsScalar()) {
     vec = "";
   } else if (lanes == 2) {
     vec = "x2";
@@ -133,9 +165,9 @@ std::string GetFP8Type(DataType type) {
   }
   stream << "__maca_fp8";
   std::string suffix;
-  if (type.code() == DataType::kFloat8_e4m3fn) {
+  if (type.MatchesCode(DLDataTypeCode::kDLFloat8_e4m3fn)) {
     suffix = "_e4m3";
-  } else if (type.code() == DataType::kFloat8_e5m2) {
+  } else if (type.MatchesCode(DLDataTypeCode::kDLFloat8_e5m2)) {
     suffix = "_e5m2";
   } else {
     LOG(FATAL) << "Unsupported FP8 type in MACA codegen";
@@ -150,7 +182,7 @@ void CodeGenMACA::Init(bool output_ssa) {
   CodeGenC::Init(output_ssa);
   vid_global_barrier_state_ = name_supply_->FreshName(runtime::symbol::tvm_global_barrier_state);
   vid_global_barrier_expect_ = name_supply_->FreshName("__barrier_expect");
-  ICHECK_EQ(vid_global_barrier_state_, runtime::symbol::tvm_global_barrier_state);
+  TVM_FFI_ICHECK_EQ(vid_global_barrier_state_, runtime::symbol::tvm_global_barrier_state);
 }
 
 void CodeGenMACA::PreFunctionBody(const PrimFunc& f) {
@@ -182,11 +214,11 @@ void CodeGenMACA::PreFunctionBody(const PrimFunc& f) {
 
 void CodeGenMACA::PrintFuncPrefix(std::ostream& os) { os << "extern \"C\" __global__ "; }
 
-class ThreadIdxExtractor : public tir::StmtVisitor {
+class ThreadIdxExtractor : public tirx::StmtVisitor {
  private:
   void VisitStmt_(const AttrStmtNode* op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
-      IterVar iv = Downcast<IterVar>(op->node);
+    if (op->attr_key == tirx::attr::thread_extent) {
+      IterVar iv = op->node.as_or_throw<IterVar>();
       if (iv->var->name_hint == "threadIdx.x" || iv->thread_tag == "threadIdx.x") {
         threadIdx_x_ext = op->value;
       }
@@ -201,17 +233,18 @@ class ThreadIdxExtractor : public tir::StmtVisitor {
   }
 
  public:
-  PrimExpr threadIdx_x_ext = Integer(1);
-  PrimExpr threadIdx_y_ext = Integer(1);
-  PrimExpr threadIdx_z_ext = Integer(1);
+  PrimExpr threadIdx_x_ext = PrimExpr(1);
+  PrimExpr threadIdx_y_ext = PrimExpr(1);
+  PrimExpr threadIdx_z_ext = PrimExpr(1);
 };
 
 void CodeGenMACA::PrintExtraAttrs(const PrimFunc& f, std::ostream& os) {
   ThreadIdxExtractor extractor;
   extractor(f->body);
   arith::Analyzer analyzer;
-  PrimExpr threadIdx_ext = analyzer.Simplify(extractor.threadIdx_x_ext * extractor.threadIdx_y_ext *
-                                             extractor.threadIdx_z_ext);
+  PrimExpr threadIdx_ext = analyzer->Simplify(extractor.threadIdx_x_ext *
+                                              extractor.threadIdx_y_ext *
+                                              extractor.threadIdx_z_ext);
   if (const IntImmNode* const threadIdx_ext_int = threadIdx_ext.as<IntImmNode>()) {
     if (threadIdx_ext_int->value == 1) {
       // unable to extract the number of threads per block, hence directly return
@@ -452,9 +485,9 @@ std::string CodeGenMACA::Finish() {
   return CodeGenC::Finish();
 }
 
-void CodeGenMACA::VisitStmt_(const tir::ForNode* op) {
-  ICHECK(is_const_int(op->min, 0));
-  if (op->kind == tir::ForKind::kUnrolled) {
+void CodeGenMACA::VisitStmt_(const tirx::ForNode* op) {
+  TVM_FFI_ICHECK(is_const_int(op->min, 0));
+  if (op->kind == tirx::ForKind::kUnrolled) {
     PrintIndent();
     stream << "#pragma unroll\n";
   }
@@ -463,10 +496,10 @@ void CodeGenMACA::VisitStmt_(const tir::ForNode* op) {
 
 void CodeGenMACA::VisitStmt_(const DeclBufferNode* op) {
   auto data = op->buffer->data;
-  ffi::String data_scope = (Downcast<PointerType>(data->type_annotation))->storage_scope.c_str();
+  ffi::String data_scope = data->type_annotation.as_or_throw<PointerType>()->storage_scope.c_str();
   if (data_scope == "shared.dyn") {
     ffi::String data_name = data->name_hint;
-    uint32_t buffer_alignment = std::max(op->buffer->dtype.bytes(), 1);
+    uint32_t buffer_alignment = std::max<size_t>(op->buffer->dtype.StorageBytes(), 1);
     auto it = shd_aligns.find(data_name);
     if (it != shd_aligns.end()) {
       shd_aligns[data_name] = std::max(shd_aligns[data_name], buffer_alignment);
@@ -478,32 +511,32 @@ void CodeGenMACA::VisitStmt_(const DeclBufferNode* op) {
 }
 
 void CodeGenMACA::BindThreadIndex(const IterVar& iv) {
-  ICHECK(!var_idmap_.count(iv->var.get()));
-  var_idmap_[iv->var.get()] = CastFromTo(iv->thread_tag, DataType::UInt(32), iv->var.dtype());
+  TVM_FFI_ICHECK(!var_idmap_.count(iv->var.get()));
+  var_idmap_[iv->var.get()] = CastFromTo(iv->thread_tag, PrimType::UInt(32), iv->var.ty());
 }
 
-void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
+void CodeGenMACA::PrintType(const PrimType& t, std::ostream& os) {  // NOLINT(*)
   int lanes = t.lanes();
-  if (t.is_handle()) {
-    ICHECK(t.is_scalar()) << "do not yet support vector types";
+  if (t.IsHandle()) {
+    TVM_FFI_ICHECK(t.IsScalar()) << "do not yet support vector types";
     os << "void*";
     return;
   }
 
-  if (t.is_void()) {
+  if (t.IsVoid()) {
     os << "void";
     return;
   }
 
   bool fail = false;
-  if (t.is_float()) {
+  if (IsFloat(t)) {
     switch (t.bits()) {
       case 16:
         enable_fp16_ = true;
-        if (t.is_scalar()) {
+        if (t.IsScalar()) {
           os << "half";
         } else if (lanes <= 8) {
-          ICHECK_EQ(lanes % 2, 0) << "Only support an even number of lanes for half type";
+          TVM_FFI_ICHECK_EQ(lanes % 2, 0) << "Only support an even number of lanes for half type";
           if (lanes <= 4) {
             os << "half" << lanes;
           } else {
@@ -524,7 +557,7 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
           // f8.v1 is emitted as *(float2*)(&(ul4.x)).x
           // f8.v2 is emitted as *(float2*)(&(ul4.x)).y
           //
-          ICHECK_EQ(lanes % 2, 0) << "only support even lane for float type with lanes > 4";
+          TVM_FFI_ICHECK_EQ(lanes % 2, 0) << "only support even lane for float type with lanes > 4";
           os << "ulonglong" << lanes / 2;
         } else {
           fail = true;
@@ -537,18 +570,18 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
         fail = true;
         break;
     }
-    if (!fail && (t.is_scalar() || t.bits() == 16)) return;
+    if (!fail && (t.IsScalar() || t.bits() == 16)) return;
     if (!fail && (lanes > 4 && lanes <= 8 && t.bits() == 32)) return;
     if (!fail && (lanes >= 2 && lanes <= 4)) {
       os << lanes;
       return;
     }
-  } else if (t.is_bfloat16()) {
+  } else if (IsBFloat16(t)) {
     enable_bf16_ = true;
-    if (t.is_scalar()) {
+    if (t.IsScalar()) {
       os << "maca_bfloat16";
     } else if (lanes <= 8) {
-      ICHECK_EQ(lanes % 2, 0) << "only support even lane for bfloat16 type";
+      TVM_FFI_ICHECK_EQ(lanes % 2, 0) << "only support even lane for bfloat16 type";
       if (lanes <= 4) {
         os << "maca_bfloat16" << lanes;
       } else {
@@ -558,7 +591,7 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
       fail = true;
     }
     if (!fail) return;
-  } else if (t.is_float8()) {
+  } else if (IsFloat8(t)) {
     enable_fp8_ = true;
     if (t.lanes() <= 4) {
       os << GetFP8Type(t);
@@ -566,10 +599,10 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
       os << "uint" << t.lanes() / 4;
     }
     return;
-  } else if (t == DataType::Bool()) {
+  } else if (t == PrimType::Bool()) {
     os << "bool";
     return;
-  } else if (t.is_vector_bool()) {
+  } else if (IsVectorBool(t)) {
     // MACA does not support bool vectors.
     // Use ushort vectors to represent instead.
     int n = t.lanes();
@@ -577,13 +610,13 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
       os << "ushort" << n;
       return;
     }
-  } else if (t.is_uint() || t.is_int()) {
-    if (t.is_uint()) {
+  } else if (IsIntOrUInt(t)) {
+    if (IsUInt(t)) {
       os << "u";
     }
     switch (t.bits()) {
       case 1: {
-        if (t.is_scalar()) {
+        if (t.IsScalar()) {
           os << "int";
           return;
         } else if (t.lanes() == 8) {
@@ -600,7 +633,7 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
         }
       }
       case 4: {
-        if (t.is_scalar()) {
+        if (t.IsScalar()) {
           os << "int";
           return;
         } else if (t.lanes() == 4) {
@@ -641,7 +674,7 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
           enable_int8_ = true;
           os << "int4";
           return;
-        } else if (!t.is_uint() && t.is_scalar()) {
+        } else if (!IsUInt(t) && t.IsScalar()) {
           os << "signed char";
           break;
         } else {
@@ -650,7 +683,7 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
         }
       }
       case 16: {
-        if (t.is_scalar()) {
+        if (t.IsScalar()) {
           os << "short";
         } else if (t.lanes() <= 4) {
           os << "short" << lanes;
@@ -664,7 +697,7 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
           // s4.z is emitted as *(short2*)(&(i2.y)).x
           // s4.w is emitted as *(short2*)(&(i2.y)).y
           //
-          ICHECK_EQ(t.lanes() % 2, 0) << "only support even lane for shorT type with lanes > 4";
+          TVM_FFI_ICHECK_EQ(t.lanes() % 2, 0) << "only support even lane for shorT type with lanes > 4";
           os << "int" << t.lanes() / 2;
         } else {
           fail = true;
@@ -675,7 +708,7 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
         break;
       }
       case 32: {
-        if (t.is_scalar()) {
+        if (t.IsScalar()) {
           os << "int";
         } else if (t.lanes() <= 4) {
           os << "int" << t.lanes();
@@ -687,7 +720,7 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
           // i8.v1 is emitted as *(int2*)(&(l4.x)).x
           // i8.v2 is emitted as *(int2*)(&(l4.x)).y
           //
-          ICHECK_EQ(lanes % 2, 0) << "only support even lane for int32 type with lanes > 4";
+          TVM_FFI_ICHECK_EQ(lanes % 2, 0) << "only support even lane for int32 type with lanes > 4";
           os << "longlong" << lanes / 2;
         } else {
           fail = true;
@@ -698,7 +731,7 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
         break;
       }
       case 64: {
-        if (t.is_scalar()) {
+        if (t.IsScalar()) {
           os << "int64_t";
         } else if (t.lanes() == 2) {
           os << "longlong2";
@@ -724,13 +757,13 @@ void CodeGenMACA::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
   LOG(FATAL) << "Cannot convert type " << t << " to MACA type";
 }
 
-void CodeGenMACA::PrintVecConstructor(DataType t, std::ostream& os) {
+void CodeGenMACA::PrintVecConstructor(const PrimType& t, std::ostream& os) {
   os << "make_";
   PrintType(t, os);
 }
 
-void CodeGenMACA::PrintVecBinaryOp(const std::string& op, DataType t, PrimExpr lhs, PrimExpr rhs,
-                                   std::ostream& os) {  // NOLINT(*)
+void CodeGenMACA::PrintVecBinaryOp(const std::string& op, const PrimType& t, PrimExpr lhs,
+                                   PrimExpr rhs, std::ostream& os) {  // NOLINT(*)
   // Declare the result.
   std::string sret = name_supply_->FreshName("_");
   this->PrintIndent();
@@ -739,22 +772,24 @@ void CodeGenMACA::PrintVecBinaryOp(const std::string& op, DataType t, PrimExpr l
   int ssa_scope = BeginScope();
   {
     // Unpack into individual ops.
-    std::string vlhs = SSAGetID(PrintExpr(lhs), lhs.dtype());
-    std::string vrhs = SSAGetID(PrintExpr(rhs), rhs.dtype());
+    PrimType lhs_ty = lhs.ty();
+    PrimType rhs_ty = rhs.ty();
+    std::string vlhs = SSAGetID(PrintExpr(lhs), lhs_ty);
+    std::string vrhs = SSAGetID(PrintExpr(rhs), rhs_ty);
 
     for (int i = 0, lanes = t.lanes(); i < lanes; ++i) {
       std::ostringstream value_temp;
       if (isalpha(op[0])) {
         value_temp << op << "(";
-        PrintVecElemLoad(vlhs, lhs.dtype(), i, value_temp);
+        PrintVecElemLoad(vlhs, lhs_ty, i, value_temp);
         value_temp << ", ";
-        PrintVecElemLoad(vrhs, rhs.dtype(), i, value_temp);
+        PrintVecElemLoad(vrhs, rhs_ty, i, value_temp);
         value_temp << ")";
       } else {
         value_temp << "(";
-        PrintVecElemLoad(vlhs, lhs.dtype(), i, value_temp);
+        PrintVecElemLoad(vlhs, lhs_ty, i, value_temp);
         value_temp << op;
-        PrintVecElemLoad(vrhs, rhs.dtype(), i, value_temp);
+        PrintVecElemLoad(vrhs, rhs_ty, i, value_temp);
         value_temp << ")";
       }
       PrintVecElemStore(sret, t, i, value_temp.str());
@@ -764,30 +799,30 @@ void CodeGenMACA::PrintVecBinaryOp(const std::string& op, DataType t, PrimExpr l
   os << sret;
 }
 
-void CodeGenMACA::PrintVecElemLoad(const std::string& vec, DataType t, int i,
+void CodeGenMACA::PrintVecElemLoad(const std::string& vec, const PrimType& t, int i,
                                    std::ostream& os) {  // NOLINT(*)
-  if (t.is_scalar()) {
+  if (t.IsScalar()) {
     os << vec;
     return;
   }
 
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < (t.bits() == 8 ? 16 : (t.bits() == 16 || t.bits() == 32) ? 8 : 4));
-  if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
-    std::string type_name = t.is_int() ? "char" : "unsigned char";
+  TVM_FFI_ICHECK(i >= 0 && i < (t.bits() == 8 ? 16 : (t.bits() == 16 || t.bits() == 32) ? 8 : 4));
+  if (t.bits() == 8 && IsIntOrUInt(t)) {
+    std::string type_name = IsInt(t) ? "char" : "unsigned char";
     if (t.lanes() == 2 || t.lanes() == 3) {
       os << vec << "." << access[i % t.lanes()];
     } else {
       std::string ac = t.lanes() == 4 ? vec : (vec + "." + access[i / 4]);
       os << "((" << type_name << ")(" << ac << " >> " << i % 4 * 8 << "))";
     }
-  } else if (t.is_float16()) {
+  } else if (IsFloat16(t)) {
     if (t.lanes() <= 4) {
       os << vec << "." << access[i];
     } else {
       os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->" << access[i % 2];
     }
-  } else if (t.is_bfloat16()) {
+  } else if (IsBFloat16(t)) {
     if (t.lanes() <= 4) {
       os << vec << "." << access[i];
     } else {
@@ -796,33 +831,33 @@ void CodeGenMACA::PrintVecElemLoad(const std::string& vec, DataType t, int i,
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
     if (t.bits() == 16) {
-      if (t.is_int()) {
+      if (IsInt(t)) {
         type_name = "short";
-      } else if (t.is_uint()) {
+      } else if (IsUInt(t)) {
         type_name = "ushort";
       }
     } else if (t.bits() == 32) {
-      if (t.is_int()) {
+      if (IsInt(t)) {
         type_name = "int";
-      } else if (t.is_uint()) {
+      } else if (IsUInt(t)) {
         type_name = "uint";
-      } else if (t.is_float()) {
+      } else if (IsFloat(t)) {
         type_name = "float";
       }
     }
-    ICHECK(!type_name.empty());
+    TVM_FFI_ICHECK(!type_name.empty());
     os << "((" << type_name << "2*)(&(" << vec << "." << access[i / 2] << ")))->" << access[i % 2];
   } else {
     os << vec << "." << access[i];
   }
 }
 
-void CodeGenMACA::PrintVecElemStore(const std::string& vec, DataType t, int i,
+void CodeGenMACA::PrintVecElemStore(const std::string& vec, const PrimType& t, int i,
                                     const std::string& value) {
   this->PrintIndent();
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < (t.bits() == 8 ? 16 : (t.bits() == 16 || t.bits() == 32) ? 8 : 4));
-  if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
+  TVM_FFI_ICHECK(i >= 0 && i < (t.bits() == 8 ? 16 : (t.bits() == 16 || t.bits() == 32) ? 8 : 4));
+  if (t.bits() == 8 && IsIntOrUInt(t)) {
     if (t.lanes() == 2 || t.lanes() == 3) {
       stream << vec << '.' << access[i % t.lanes()] << "="
              << "(" << value << ");\n";
@@ -835,7 +870,7 @@ void CodeGenMACA::PrintVecElemStore(const std::string& vec, DataType t, int i,
       }
       stream << "(" << value << " << " << i % 4 * 8 << ");\n";
     }
-  } else if (t.is_float16()) {
+  } else if (IsFloat16(t)) {
     if (t.lanes() <= 4) {
       stream << vec << "." << access[i] << " = " << value << ";\n";
     } else {
@@ -843,7 +878,7 @@ void CodeGenMACA::PrintVecElemStore(const std::string& vec, DataType t, int i,
              << value << ";\n";
     }
 
-  } else if (t.is_bfloat16()) {
+  } else if (IsBFloat16(t)) {
     if (t.lanes() <= 4) {
       stream << vec << "." << access[i] << " = " << value << ";\n";
     } else {
@@ -853,21 +888,21 @@ void CodeGenMACA::PrintVecElemStore(const std::string& vec, DataType t, int i,
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
     if (t.bits() == 16) {
-      if (t.is_int()) {
+      if (IsInt(t)) {
         type_name = "short";
-      } else if (t.is_uint()) {
+      } else if (IsUInt(t)) {
         type_name = "ushort";
       }
     } else if (t.bits() == 32) {
-      if (t.is_int()) {
+      if (IsInt(t)) {
         type_name = "int";
-      } else if (t.is_uint()) {
+      } else if (IsUInt(t)) {
         type_name = "uint";
-      } else if (t.is_float()) {
+      } else if (IsFloat(t)) {
         type_name = "float";
       }
     }
-    ICHECK(!type_name.empty());
+    TVM_FFI_ICHECK(!type_name.empty());
     stream << "((" << type_name << "2*)(&(" << vec << "." << access[i / 2] << ")))->"
            << access[i % 2] << " = " << value << ";\n";
   } else {
@@ -916,7 +951,7 @@ void CodeGenMACA::PrintStorageSync(const CallNode* op) {
 }
 
 void CodeGenMACA::PrintStorageScope(const std::string& scope, std::ostream& os) {  // NOLINT(*)
-  ICHECK_NE(scope, "global") << "Cannot allocate global memory when targeting MACA. You must pass "
+  TVM_FFI_ICHECK_NE(scope, "global") << "Cannot allocate global memory when targeting MACA. You must pass "
                                 "all global arrays as input instead";
   if (scope == "shared") {
     os << "__shared__ ";
@@ -925,15 +960,16 @@ void CodeGenMACA::PrintStorageScope(const std::string& scope, std::ostream& os) 
   }
 }
 
-std::string CodeGenMACA::CastFromTo(std::string value, DataType from, DataType target) {
+std::string CodeGenMACA::CastFromTo(std::string value, const PrimType& from,
+                                    const PrimType& target) {
   if (from == target) return value;
   std::ostringstream os;
   os << "((";
   this->PrintType(target, os);
   os << ")";
-  if (from.is_float16() && (target.is_int() || target.is_uint()) && target.bits() == 8) {
+  if (IsFloat16(from) && IsIntOrUInt(target) && target.bits() == 8) {
     os << "(";
-    if (target.is_uint()) {
+    if (IsUInt(target)) {
       os << "u";
     }
     os << "int)";
@@ -943,17 +979,16 @@ std::string CodeGenMACA::CastFromTo(std::string value, DataType from, DataType t
 }
 
 void CodeGenMACA::VisitExpr_(const CastNode* op, std::ostream& os) {
-  DataType from_ty = op->value.dtype();
-  DataType target_ty = op->dtype;
-  ICHECK_EQ(target_ty.lanes(), from_ty.lanes());
+  PrimType from_ty = op->value.ty();
+  PrimType target_ty = op->ty();
+  TVM_FFI_ICHECK_EQ(target_ty.lanes(), from_ty.lanes());
 
   // Emit simple C-style type conversion.
-  if (from_ty.is_scalar()) return CodeGenC::VisitExpr_(op, os);
+  if (from_ty.IsScalar()) return CodeGenC::VisitExpr_(op, os);
 
-  if (target_ty.code() == DataType::kFloat8_e4m3fn || target_ty.code() == DataType::kFloat8_e5m2 ||
-      from_ty.code() == DataType::kFloat8_e4m3fn || from_ty.code() == DataType::kFloat8_e5m2) {
+  if (IsFloat8(target_ty) || IsFloat8(from_ty)) {
     std::ostringstream val;
-    if (target_ty.code() == DataType::kBFloat && target_ty.lanes() == 2) {
+    if (target_ty.MatchesCode(DLDataTypeCode::kDLBfloat) && target_ty.lanes() == 2) {
       val << "cast_to_maca_bfloat162(" << PrintExpr(op->value) << ")";
     } else {
       val << "(";
@@ -975,7 +1010,7 @@ void CodeGenMACA::VisitExpr_(const CastNode* op, std::ostream& os) {
     for (int i = 0, lanes = from_ty.lanes(); i < lanes; ++i) {
       std::ostringstream val;
       val << "(";
-      PrintType(target_ty.element_of(), val);
+      PrintType(target_ty.WithLanes(1), val);
       val << ")(";
       PrintVecElemLoad(src, from_ty, i, val);
       val << ")";
@@ -987,8 +1022,9 @@ void CodeGenMACA::VisitExpr_(const CastNode* op, std::ostream& os) {
 
 void CodeGenMACA::PrintCallExtern(Type ret_type, ffi::String global_symbol, const ffi::Array<PrimExpr>& args,
                                   bool skip_first_arg, std::ostream& os) {  // NOLINT(*)
-  DataType ret_dtype = GetRuntimeDataType(ret_type);
-  if (ret_dtype.is_fixed_length_vector()) {
+  DLDataType ret_dtype = GetRuntimeDataType(ret_type);
+  PrimType ret_ty(ret_dtype);
+  if (ret_ty.IsFixedLengthVector()) {
     //
     // Emit an unsupported vector call
     //
@@ -1010,27 +1046,27 @@ void CodeGenMACA::PrintCallExtern(Type ret_type, ffi::String global_symbol, cons
     // Declare the result vector.
     std::string sret = name_supply_->FreshName("_");
     this->PrintIndent();
-    this->PrintType(ret_dtype, stream);
+    this->PrintType(ret_ty, stream);
     stream << ' ' << sret << ";\n";
     {
       // Load arguments.
       std::vector<std::string> sargs;
       size_t arg_begin = static_cast<size_t>(skip_first_arg);
       for (size_t i = arg_begin; i < args.size(); ++i) {
-        std::string val = SSAGetID(PrintExpr(args[i]), args[i].dtype());
+        std::string val = SSAGetID(PrintExpr(args[i]), args[i].ty());
         sargs.push_back(std::move(val));
       }
 
       // Emit a scalar call for each lane.
-      for (int i = 0; i < ret_dtype.lanes(); ++i) {
+      for (int i = 0; i < ret_ty.lanes(); ++i) {
         std::ostringstream scall;
         scall << global_symbol << "(";
         for (size_t j = 0; j < sargs.size(); ++j) {
           if (j > 0) scall << ", ";
-          PrintVecElemLoad(sargs[j], args[arg_begin + j].dtype(), i, scall);
+          PrintVecElemLoad(sargs[j], args[arg_begin + j].ty(), i, scall);
         }
         scall << ")";
-        PrintVecElemStore(sret, ret_dtype, i, scall.str());
+        PrintVecElemStore(sret, ret_ty, i, scall.str());
       }
     }
     os << sret;
@@ -1038,16 +1074,12 @@ void CodeGenMACA::PrintCallExtern(Type ret_type, ffi::String global_symbol, cons
     CodeGenC::PrintCallExtern(ret_type, global_symbol, args, skip_first_arg, os);
   }
 }
-static int stoi(const std::string& str) {
-  try {
-    return std::stoi(str);
-  } catch (std::invalid_argument& e) {
-    LOG(FATAL) << "Cannot convert \"" << str << "\" to int";
-    throw;
-  }
-}
-
 void CodeGenMACA::VisitExpr_(const CallNode* op, std::ostream& os) {
+  static const Op& tvm_fill_fragment_op = Op::Get("tirx.tvm_fill_fragment");
+  static const Op& tvm_load_matrix_sync_op = Op::Get("tirx.tvm_load_matrix_sync");
+  static const Op& tvm_store_matrix_sync_op = Op::Get("tirx.tvm_store_matrix_sync");
+  static const Op& tvm_mma_sync_op = Op::Get("tirx.tvm_mma_sync");
+  static const Op& tvm_bmma_sync_op = Op::Get("tirx.tvm_bmma_sync");
   if (auto opt_call_opt = op->op.as<Op>()) {
     Op call_op = opt_call_opt.value();
     // This is only for backward compatibility with __shfl_{up/down}.
@@ -1057,9 +1089,9 @@ void CodeGenMACA::VisitExpr_(const CallNode* op, std::ostream& os) {
     }
   }
 
-  if (op->op.same_as(builtin::tvm_fill_fragment())) {
+  if (op->op.same_as(tvm_fill_fragment_op)) {
     need_mma_h_ = true;
-    ICHECK_EQ(op->args.size(), 6U);
+    TVM_FFI_ICHECK_EQ(op->args.size(), 6U);
     os << "mxmaca::wmma::fill_fragment(";
     this->PrintExpr(op->args[0], os);
     os << "[";
@@ -1067,9 +1099,9 @@ void CodeGenMACA::VisitExpr_(const CallNode* op, std::ostream& os) {
     os << "], ";
     this->PrintExpr(op->args[5], os);
     os << ")";
-  } else if (op->op.same_as(builtin::tvm_load_matrix_sync())) {
+  } else if (op->op.same_as(tvm_load_matrix_sync_op)) {
     need_mma_h_ = true;
-    ICHECK_EQ(op->args.size(), 8U);
+    TVM_FFI_ICHECK_EQ(op->args.size(), 8U);
     os << "mxmaca::wmma::load_matrix_sync(";
     this->PrintExpr(op->args[0], os);
     os << "[";
@@ -1079,9 +1111,9 @@ void CodeGenMACA::VisitExpr_(const CallNode* op, std::ostream& os) {
     os << ", ";
     this->PrintExpr(op->args[6], os);
     os << ")";
-  } else if (op->op.same_as(builtin::tvm_store_matrix_sync())) {
+  } else if (op->op.same_as(tvm_store_matrix_sync_op)) {
     need_mma_h_ = true;
-    ICHECK_EQ(op->args.size(), 8U);
+    TVM_FFI_ICHECK_EQ(op->args.size(), 8U);
     os << "mxmaca::wmma::store_matrix_sync(";
     this->PrintExpr(op->args[5], os);
     os << ", ";
@@ -1096,9 +1128,9 @@ void CodeGenMACA::VisitExpr_(const CallNode* op, std::ostream& os) {
       LOG(FATAL) << "Invalid parameters";
     }
     os << ")";
-  } else if (op->op.same_as(builtin::tvm_mma_sync())) {
+  } else if (op->op.same_as(tvm_mma_sync_op)) {
     need_mma_h_ = true;
-    ICHECK_EQ(op->args.size(), 8U);
+    TVM_FFI_ICHECK_EQ(op->args.size(), 8U);
     os << "mxmaca::wmma::mma_sync(";
     for (int i = 0; i < 4; ++i) {
       this->PrintExpr(op->args[i * 2], os);
@@ -1106,9 +1138,9 @@ void CodeGenMACA::VisitExpr_(const CallNode* op, std::ostream& os) {
       this->PrintExpr(op->args[i * 2 + 1], os);
       os << "]" << ((i < 3) ? ", " : ")");
     }
-  } else if (op->op.same_as(builtin::tvm_bmma_sync())) {
+  } else if (op->op.same_as(tvm_bmma_sync_op)) {
     need_mma_h_ = true;
-    ICHECK_EQ(op->args.size(), 8U);
+    TVM_FFI_ICHECK_EQ(op->args.size(), 8U);
     os << "mxmaca::wmma::bmma_sync(";
     for (int i = 0; i < 4; ++i) {
       this->PrintExpr(op->args[i * 2], os);
@@ -1116,43 +1148,29 @@ void CodeGenMACA::VisitExpr_(const CallNode* op, std::ostream& os) {
       this->PrintExpr(op->args[i * 2 + 1], os);
       os << "]" << ((i < 3) ? ", " : ")");
     }
-  } else if (op->op.same_as(builtin::create_barriers())) {
-    CHECK_EQ(barrier_count_, -1);
-    int barrier_count = Downcast<IntImm>(op->args[0])->value;
-    // pad barrier alignment to avoid runtime alignment errors
-    CHECK_EQ(barrier_alignment_bytes_ % sizeof(uint64_t), 0);
-    int barrier_alignment_count = barrier_alignment_bytes_ / sizeof(uint64_t);
-    if (barrier_count % barrier_alignment_count != 0) {
-      barrier_count = ((barrier_count / barrier_alignment_count) + 1) * barrier_alignment_count;
-    }
-    barrier_count_ = barrier_count;
-    this->stream << "__shared__ __align__(" << barrier_alignment_bytes_ << ") uint64_t "
-                 << barrier_name_ << "[" << barrier_count << "];\n";
-    this->stream << "for (int i = 0; i < " << barrier_count << "; ++i) { " << barrier_name_
-                 << "[i] = 0; }\n";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
 }
 
 void CodeGenMACA::VisitStmt_(const AttrStmtNode* op) {
-  if (op->attr_key == tir::attr::fragment_shape) {
+  if (op->attr_key == tirx::attr::fragment_shape) {
     const VarNode* buffer = op->node.as<VarNode>();
     const StringImmNode* shape_str = op->value.as<StringImmNode>();
     fragment_shapes[buffer] = shape_str->value;
-  } else if (op->attr_key == tir::attr::fragment_layout) {
+  } else if (op->attr_key == tirx::attr::fragment_layout) {
     const VarNode* buffer = op->node.as<VarNode>();
     const StringImmNode* layout_str = op->value.as<StringImmNode>();
     fragment_layouts[buffer] = layout_str->value;
-  } else if (op->attr_key == tir::attr::async_commit_queue_scope) {
+  } else if (op->attr_key == tirx::attr::async_commit_queue_scope) {
     const IntImmNode* queue_id = op->value.as<IntImmNode>();
-    ICHECK(queue_id && queue_id->value == 0) << "For MACA, the index of an async queue must be 0.";
+    TVM_FFI_ICHECK(queue_id && queue_id->value == 0) << "For MACA, the index of an async queue must be 0.";
     this->VisitStmt(op->body);
     return;
-  } else if (op->attr_key == tir::attr::async_wait_queue_scope) {
+  } else if (op->attr_key == tirx::attr::async_wait_queue_scope) {
     auto wait_attrs = GetAsyncWaitAttributes(op);
     auto queue_id = wait_attrs.first.as<IntImmNode>();
-    ICHECK(queue_id && queue_id->value == 0) << "For MACA, the index of an async queue must be 0.";
+    TVM_FFI_ICHECK(queue_id && queue_id->value == 0) << "For MACA, the index of an async queue must be 0.";
     // TODO(metax): Because the data type of the operation written into this block cannot be
     // obtained temporarily, for a barrier_arrive_and_wait function that only involves one type
     // of data,assume that if there is a method to obtain it in the future, replace the bit here.
@@ -1174,63 +1192,94 @@ void CodeGenMACA::VisitStmt_(const AttrStmtNode* op) {
       this->stream << write_idx_ << "= (" << write_idx_ << " + 1) & " << mask_ << ";\n";
     }
     auto inner = op->body.as<AttrStmtNode>();
-    ICHECK(inner);
+    TVM_FFI_ICHECK(inner);
     this->VisitStmt(inner->body);
     return;
   }
   CodeGenC::VisitStmt_(op);
 }
 
-void CodeGenMACA::VisitStmt_(const AllocateNode* op) {
-  ICHECK(!is_zero(op->condition));
-  std::string vid = AllocVarID(op->buffer_var.get());
+void CodeGenMACA::VisitStmt_(const AllocBufferNode* op) {
+  TVM_FFI_ICHECK(op->buffer.defined());
+  std::string vid = AllocVarID(op->buffer->data.get());
 
   this->PrintIndent();
-  std::string scope = GetPtrStorageScope(op->buffer_var);
-  const VarNode* buffer = op->buffer_var.as<VarNode>();
+  std::string scope = GetPtrStorageScope(op->buffer->data);
+  const VarNode* buffer = op->buffer->data.as<VarNode>();
+  PrimType dtype = op->buffer->dtype;
   if (scope.find("wmma.") == 0) {
     if (scope == "wmma.matrix_a" || scope == "wmma.matrix_b") {
-      ICHECK(op->dtype == DataType::Float(16) || op->dtype == DataType::Int(8) ||
-             op->dtype == DataType::UInt(8) || op->dtype == DataType::Int(4) ||
-             op->dtype == DataType::UInt(4) || op->dtype == DataType::Int(1) ||
-             op->dtype == DataType::BFloat(16) || op->dtype == DataType::Float(32))
+      bool supported_wmma_input_dtype =
+          dtype == PrimType::Float(16) || dtype == PrimType::Int(8) ||
+          dtype == PrimType::UInt(8) || dtype == PrimType(DLDataType{kDLInt, 4, 1}) ||
+          dtype == PrimType(DLDataType{kDLUInt, 4, 1}) ||
+          dtype == PrimType(DLDataType{kDLInt, 1, 1}) ||
+          dtype == PrimType(DLDataType{kDLBfloat, 16, 1}) || dtype == PrimType::Float(32);
+      TVM_FFI_ICHECK(supported_wmma_input_dtype)
           << "Matrix_a and matrix_b only support half or char or unsigned char "
           << "or uint4 or int4 or int1 type for now";
     } else {
-      ICHECK(op->dtype == DataType::Float(16) || op->dtype == DataType::Float(32) ||
-             op->dtype == DataType::Int(32))
+      bool supported_wmma_accumulator_dtype =
+          dtype == PrimType::Float(16) || dtype == PrimType::Float(32) ||
+          dtype == PrimType::Int(32);
+      TVM_FFI_ICHECK(supported_wmma_accumulator_dtype)
           << "Accumulator only support half, float and int type for now";
     }
-    PrintWmmaScope(scope, op->dtype, buffer, stream);
+    PrintWmmaScope(scope, dtype, buffer, stream);
   } else {
     PrintStorageScope(scope, stream);
-    PrintType(op->dtype, stream);
+    int align = op->buffer->data_alignment;
+    auto anno_it = op->annotations.find(tirx::attr::buffer_data_alignment);
+    if (anno_it != op->annotations.end()) {
+      if (const auto* n = (*anno_it).second.as<IntImmNode>()) {
+        align = n->value;
+      }
+    }
+    auto shd_it = shd_aligns.find(vid);
+    if (shd_it != shd_aligns.end()) {
+      align = std::max<int>(align, shd_it->second);
+    }
+    if (scope == "shared.dyn") {
+      PrintType(dtype, stream);
+      stream << ' ';
+      if (align > 0) {
+        stream << "__align__(" << align << ") ";
+      }
+    } else {
+      if (align > 0) {
+        stream << "alignas(" << align << ") ";
+      }
+      PrintType(dtype, stream);
+    }
   }
 
   if (scope == "shared.dyn") {
-    std::string alignment = "";
-    auto it = shd_aligns.find(vid);
-    if (it != shd_aligns.end()) {
-      alignment = "__align__(" + std::to_string(it->second) + ") ";
-    }
-    stream << ' ' << alignment << vid << "[];\n";
+    stream << vid << "[];\n";
   } else {
-    size_t constant_size = op->ConstantAllocationSize();
-    ICHECK_GT(constant_size, 0) << "Can only handle constant size stack allocation for now";
+    size_t constant_size = 1;
+    for (const auto& dim : op->buffer->shape) {
+      const IntImmNode* dim_imm = dim.as<IntImmNode>();
+      TVM_FFI_ICHECK(dim_imm) << "Can only handle constant size stack allocation for now";
+      constant_size *= dim_imm->value;
+    }
+    TVM_FFI_ICHECK_GT(constant_size, 0) << "Can only handle constant size stack allocation for now";
 
     if (scope.find("wmma.") == 0) {
       constant_size = GetWmmaFragmentSize(scope, buffer, constant_size);
     }
-    if ((op->dtype == DataType::Int(4) || op->dtype == DataType::UInt(4) ||
-         op->dtype == DataType::Int(1)) &&
-        scope == "shared") {
-      constant_size = constant_size / (32 / op->dtype.bits());
+    bool is_packed_integer_dtype = dtype == PrimType(DLDataType{kDLInt, 4, 1}) ||
+                                   dtype == PrimType(DLDataType{kDLUInt, 4, 1}) ||
+                                   dtype == PrimType(DLDataType{kDLInt, 1, 1});
+    if (is_packed_integer_dtype && scope == "shared") {
+      constant_size = constant_size / (32 / dtype.bits());
     }
     stream << ' ' << vid << '[' << constant_size << "];\n";
   }
 
-  RegisterHandleType(op->buffer_var.get(), op->dtype);
-  this->PrintStmt(op->body);
+  RegisterHandleType(op->buffer->data.get(), dtype);
+  if (op->annotations.count(tirx::attr::kVolatile)) {
+    MarkVolatile(op->buffer->data.get());
+  }
 }
 
 void CodeGenMACA::VisitStmt_(const EvaluateNode* op) {
@@ -1251,9 +1300,10 @@ void CodeGenMACA::VisitStmt_(const EvaluateNode* op) {
 }
 
 void CodeGenMACA::VisitExpr_(const RampNode* op, std::ostream& os) {
-  int lanes = op->dtype.lanes();
-  CHECK_LE(lanes, 4) << "ValueError: Ramp of more than 4 lanes is not allowed.";
-  PrintVecConstructor(op->dtype, os);
+  PrimType op_ty = op->ty();
+  int lanes = op_ty.lanes();
+  TVM_FFI_ICHECK_LE(lanes, 4) << "ValueError: Ramp of more than 4 lanes is not allowed.";
+  PrintVecConstructor(op_ty, os);
   os << "(";
   for (int i = 0; i < lanes; i++) {
     os << "(" << PrintExpr(op->base) << ")"
@@ -1264,27 +1314,28 @@ void CodeGenMACA::VisitExpr_(const RampNode* op, std::ostream& os) {
 }
 
 void CodeGenMACA::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NOLINT(*)
-  int lanes = op->dtype.lanes();
-  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
+  PrimType op_ty = op->ty();
+  int lanes = op_ty.lanes();
+  if (IsIntOrUInt(op_ty) && op_ty.bits() == 8) {
     bool fail = false;
     const int64_t* p = as_const_int(op->value);
-    ICHECK(p);
+    TVM_FFI_ICHECK(p);
     int64_t v = *p & 0xFF;
     v = (v << 24) | (v << 16) | (v << 8) | v;
     if (lanes == 4) {
       // make_int8x4
-      if (op->dtype.is_uint()) {
+      if (IsUInt(op_ty)) {
         os << "(uint)" << v;
       } else {
         os << "(int)" << v;
       }
     } else if (lanes == 8 || lanes == 16) {
       // [MXMACA] make_int2 or make_int4
-      PrintVecConstructor(op->dtype, os);
+      PrintVecConstructor(op_ty, os);
       os << '(';
       for (int i = 0; i < lanes / 4; ++i) {
         if (i != 0) os << ", ";
-        if (op->dtype.is_uint()) {
+        if (IsUInt(op_ty)) {
           os << "(uint)" << v;
         } else {
           os << "(int)" << v;
@@ -1300,9 +1351,9 @@ void CodeGenMACA::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NO
     }
   }
 
-  if (op->dtype.is_float16()) {
+  if (IsFloat16(op_ty)) {
     std::string v = PrintExpr(op->value);
-    PrintVecConstructor(op->dtype, os);
+    PrintVecConstructor(op_ty, os);
     os << '(';
     if (lanes <= 4) {
       for (int i = 0; i < lanes / 2; ++i) {
@@ -1319,9 +1370,9 @@ void CodeGenMACA::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NO
     return;
   }
 
-  if (op->dtype.is_bfloat16()) {
+  if (IsBFloat16(op_ty)) {
     std::string v = PrintExpr(op->value);
-    PrintVecConstructor(op->dtype, os);
+    PrintVecConstructor(op_ty, os);
     os << '(';
     if (lanes > 4) {
       for (int i = 0; i < lanes / 2; ++i) {
@@ -1338,12 +1389,12 @@ void CodeGenMACA::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NO
     return;
   }
 
-  if (op->dtype.is_float8()) {
-    int lanes = op->dtype.lanes();
-    ICHECK(lanes == 1 || lanes == 2 || lanes == 4);
+  if (IsFloat8(op_ty)) {
+    int lanes = op_ty.lanes();
+    TVM_FFI_ICHECK(lanes == 1 || lanes == 2 || lanes == 4);
     std::string v = PrintExpr(op->value);
     // Implicit conversion from float back to fp8
-    PrintType(op->dtype, os);
+    PrintType(op_ty, os);
     os << "(make_float" << lanes << "(";
     for (int i = 0; i < lanes; ++i) {
       if (i != 0) os << ", ";
@@ -1353,15 +1404,49 @@ void CodeGenMACA::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NO
     return;
   }
 
-  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 4) {
+  if (IsFloat(op_ty) && op_ty.bits() == 32 && lanes > 4 && lanes <= 8) {
+    std::string v = PrintExpr(op->value);
+    PrintVecConstructor(op_ty, os);
+    os << '(';
+    for (int i = 0; i < lanes / 2; ++i) {
+      if (i != 0) os << ", ";
+      os << "((unsigned long long)(__float_as_uint(" << v << ")) | "
+         << "((unsigned long long)(__float_as_uint(" << v << ")) << 32))";
+    }
+    os << ')';
+    return;
+  }
+
+  if (IsIntOrUInt(op_ty) && (op_ty.bits() == 16 || op_ty.bits() == 32) && lanes > 4 &&
+      lanes <= 8) {
+    std::string v = PrintExpr(op->value);
+    PrintVecConstructor(op_ty, os);
+    os << '(';
+    for (int i = 0; i < lanes / 2; ++i) {
+      if (i != 0) os << ", ";
+      if (op_ty.bits() == 16) {
+        const char* component_type = IsUInt(op_ty) ? "unsigned int" : "int";
+        os << "((" << component_type << ")(((unsigned int)((unsigned short)(" << v << "))) | "
+           << "(((unsigned int)((unsigned short)(" << v << "))) << 16)))";
+      } else {
+        const char* component_type = IsUInt(op_ty) ? "unsigned long long" : "long long";
+        os << "((" << component_type << ")(((unsigned long long)((unsigned int)(" << v << "))) | "
+           << "(((unsigned long long)((unsigned int)(" << v << "))) << 32)))";
+      }
+    }
+    os << ')';
+    return;
+  }
+
+  if (IsIntOrUInt(op_ty) && op_ty.bits() == 4) {
     bool fail = false;
     const int64_t* p = as_const_int(op->value);
-    ICHECK(p);
+    TVM_FFI_ICHECK(p);
     int64_t v = *p & 0xF;
 
     if (lanes == 4) {
       v = (v << 12) | (v << 8) | (v << 4) | v;
-      if (op->dtype.is_uint()) {
+      if (IsUInt(op_ty)) {
         os << "(uint16_t)" << v;
       } else {
         os << "(int16_t)" << v;
@@ -1369,17 +1454,17 @@ void CodeGenMACA::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NO
     } else {
       v = (v << 28) | (v << 24) | (v << 20) | (v << 16) | (v << 12) | (v << 8) | (v << 4) | v;
       if (lanes == 8) {
-        if (op->dtype.is_uint()) {
+        if (IsUInt(op_ty)) {
           os << "(uint)" << v;
         } else {
           os << "(int)" << v;
         }
       } else if (lanes == 16 || lanes == 32) {
-        PrintVecConstructor(op->dtype, os);
+        PrintVecConstructor(op_ty, os);
         os << '(';
         for (int i = 0; i < lanes / 8; ++i) {
           if (i != 0) os << ", ";
-          if (op->dtype.is_uint()) {
+          if (IsUInt(op_ty)) {
             os << "(uint)" << v;
           } else {
             os << "(int)" << v;
@@ -1397,7 +1482,7 @@ void CodeGenMACA::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NO
   }
 
   std::string v = PrintExpr(op->value);
-  PrintVecConstructor(op->dtype, os);
+  PrintVecConstructor(op_ty, os);
   os << '(';
   for (int i = 0; i < lanes; ++i) {
     if (i != 0) os << ", ";
@@ -1407,59 +1492,61 @@ void CodeGenMACA::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // NO
 }
 
 void CodeGenMACA::VisitExpr_(const SelectNode* op, std::ostream& os) {
+  PrimType op_ty = op->ty();
   // Non-vector cases.
-  if (!op->dtype.is_fixed_length_vector()) {
+  if (!op_ty.IsFixedLengthVector()) {
     CodeGenC::VisitExpr_(op, os);
     return;
   }
 
   // Codegen vector condition case by serializing the select op.
-  ICHECK(op->false_value->dtype == op->dtype && op->true_value->dtype == op->dtype &&
-         op->dtype.lanes() == op->condition.dtype().lanes());
+  TVM_FFI_ICHECK(op->false_value.ty() == op_ty && op->true_value.ty() == op_ty &&
+         op_ty.lanes() == op->condition.ty().lanes());
 
   std::string r_var = name_supply_->FreshName("_");
   this->PrintIndent();
-  this->PrintType(op->dtype, stream);
+  this->PrintType(op_ty, stream);
   stream << ' ' << r_var << ";\n";
   {
-    std::string c_var = SSAGetID(PrintExpr(op->condition), op->dtype);
-    std::string t_var = SSAGetID(PrintExpr(op->true_value), op->dtype);
-    std::string f_var = SSAGetID(PrintExpr(op->false_value), op->dtype);
+    std::string c_var = SSAGetID(PrintExpr(op->condition), op_ty);
+    std::string t_var = SSAGetID(PrintExpr(op->true_value), op_ty);
+    std::string f_var = SSAGetID(PrintExpr(op->false_value), op_ty);
 
     // The condition is stored as an ushort vector.
-    int lanes = op->dtype.lanes();
-    DataType memory_ty(DataType::TypeCode::kUInt, 16, lanes);
+    int lanes = op_ty.lanes();
+    PrimType memory_ty(DLDataType{kDLUInt, 16, static_cast<uint16_t>(lanes)});
 
     for (int i = 0; i < lanes; ++i) {
       std::ostringstream item;
       item << "(bool(";
       PrintVecElemLoad(c_var, memory_ty, i, item);
       item << ")?";
-      PrintVecElemLoad(t_var, op->dtype, i, item);
+      PrintVecElemLoad(t_var, op_ty, i, item);
       item << ':';
-      PrintVecElemLoad(f_var, op->dtype, i, item);
+      PrintVecElemLoad(f_var, op_ty, i, item);
       item << ')';
-      PrintVecElemStore(r_var, op->dtype, i, item.str());
+      PrintVecElemStore(r_var, op_ty, i, item.str());
     }
   }
   os << r_var;
 }
 
 inline void PrintConst(const FloatImmNode* op, std::ostream& os, CodeGenMACA* p) {  // NOLINT(*)
+  PrimType op_ty = op->ty();
   // Type code is kBFloat
-  if (op->dtype.is_bfloat16()) {
+  if (IsBFloat16(op_ty)) {
     os << "__float2bfloat16_rn";
     os << '(' << std::scientific << op->value << 'f' << ')';
     return;
   }
   // Type code is kFloat8_e5m2 or kE4M4Float
-  if (op->dtype.is_float8()) {
-    p->PrintType(op->dtype, os);
+  if (IsFloat8(op_ty)) {
+    p->PrintType(op_ty, os);
     os << '(' << std::scientific << op->value << 'f' << ')';
     return;
   }
   // Type code is kFloat
-  switch (op->dtype.bits()) {
+  switch (op_ty.bits()) {
     case 64:
     case 32: {
       std::ostringstream temp;
@@ -1467,14 +1554,14 @@ inline void PrintConst(const FloatImmNode* op, std::ostream& os, CodeGenMACA* p)
         if (op->value < 0) {
           temp << "-";
         }
-        temp << ((op->dtype.bits() == 32) ? "MACART_INF_F" : "MACART_INF");
+        temp << ((op_ty.bits() == 32) ? "MACART_INF_F" : "MACART_INF");
         p->need_math_constants_h_ = true;
       } else if (std::isnan(op->value)) {
-        temp << ((op->dtype.bits() == 32) ? "MACART_NAN_F" : "MACART_NAN");
+        temp << ((op_ty.bits() == 32) ? "MACART_NAN_F" : "MACART_NAN");
         p->need_math_constants_h_ = true;
       } else {
         temp << std::scientific << op->value;
-        if (op->dtype.bits() == 32) temp << 'f';
+        if (op_ty.bits() == 32) temp << 'f';
       }
       p->MarkConst(temp.str());
       os << temp.str();
@@ -1482,13 +1569,13 @@ inline void PrintConst(const FloatImmNode* op, std::ostream& os, CodeGenMACA* p)
     }
     case 16: {
       os << "__float2half" << '(';
-      FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
+      FloatImm const_f32 = FloatImm(PrimType::Float(32), op->value);
       PrintConst(const_f32.get(), os, p);
       os << ')';
       break;
     }
     default:
-      LOG(FATAL) << "Bad bit-width for float: " << op->dtype << "\n";
+      LOG(FATAL) << "Bad bit-width for float: " << op_ty << "\n";
   }
 }
 
@@ -1496,16 +1583,16 @@ void CodeGenMACA::VisitExpr_(const FloatImmNode* op, std::ostream& os) {  // NOL
   PrintConst(op, os, this);
 }
 
-void CodeGenMACA::PrintWmmaScope(const std::string& scope, DataType t, const VarNode* variable,
-                                 std::ostream& os) {
+void CodeGenMACA::PrintWmmaScope(const std::string& scope, const PrimType& t,
+                                 const VarNode* variable, std::ostream& os) {
   std::stringstream type;
   PrintType(t, type);
-  ICHECK(fragment_shapes.count(variable))
+  TVM_FFI_ICHECK(fragment_shapes.count(variable))
       << "Cannot find shape of the wmma fragment " << variable->name_hint;
   std::string shape_str = fragment_shapes.at(variable);
-  if ((t.is_int() || t.is_uint()) && t.bits() < 8 && t.lanes() == 1) {
+  if (IsIntOrUInt(t) && t.bits() < 8 && t.lanes() == 1) {
     type.str(std::string());
-    if (t.is_int()) {
+    if (IsInt(t)) {
       if (t.bits() == 4) {
         type << "mxmaca::wmma::experimental::precision::s4";
       } else if (t.bits() == 1) {
@@ -1513,7 +1600,7 @@ void CodeGenMACA::PrintWmmaScope(const std::string& scope, DataType t, const Var
       } else {
         LOG(FATAL) << "Unhandled interger type for wmma fragment!";
       }
-    } else if (t.is_uint()) {
+    } else if (IsUInt(t)) {
       if (t.bits() == 4) {
         type << "mxmaca::wmma::experimental::precision::u4";
       } else {
@@ -1524,13 +1611,13 @@ void CodeGenMACA::PrintWmmaScope(const std::string& scope, DataType t, const Var
   if (scope == "wmma.matrix_a") {
     need_mma_h_ = true;
     std::string layout_str = fragment_layouts[variable];
-    ICHECK_NE(layout_str, "") << "Layout must be defined for matrix_a";
+    TVM_FFI_ICHECK_NE(layout_str, "") << "Layout must be defined for matrix_a";
     os << "mxmaca::wmma::fragment<mxmaca::wmma::matrix_a, " << shape_str << ", " << type.str()
        << ", mxmaca::wmma::" << layout_str << ">";
   } else if (scope == "wmma.matrix_b") {
     need_mma_h_ = true;
     std::string layout_str = fragment_layouts[variable];
-    ICHECK_NE(layout_str, "") << "Layout must be defined for matrix_b";
+    TVM_FFI_ICHECK_NE(layout_str, "") << "Layout must be defined for matrix_b";
     os << "mxmaca::wmma::fragment<mxmaca::wmma::matrix_b, " << shape_str << ", " << type.str()
        << ", mxmaca::wmma::" << layout_str << ">";
   } else if (scope == "wmma.accumulator") {
@@ -1542,7 +1629,7 @@ void CodeGenMACA::PrintWmmaScope(const std::string& scope, DataType t, const Var
 
 int32_t CodeGenMACA::GetWmmaFragmentSize(const std::string& scope, const VarNode* variable,
                                          int32_t size) {
-  ICHECK(fragment_shapes.count(variable))
+  TVM_FFI_ICHECK(fragment_shapes.count(variable))
       << "Cannot find shape of the wmma fragment " << variable->name_hint;
   std::string shape_str = fragment_shapes.at(variable);
   std::pair<int32_t, int32_t> dim = GetWmmaFragmentDimSize(shape_str, scope);
@@ -1557,19 +1644,20 @@ void CodeGenMACA::HandleVolatileLoads(const std::string& value, const BufferLoad
   // Cast away volatile qualifier for fp16 types. That is, only loads and
   // stores are volatile. The loaded objects are not marked as volatile.
   //
-  if ((op->dtype.is_float16() || op->dtype.is_bfloat16()) && IsVolatile(op->buffer->data.get())) {
+  PrimType op_ty = op->ty();
+  if ((IsFloat16(op_ty) || IsBFloat16(op_ty)) && IsVolatile(op->buffer->data.get())) {
     os << "(";
-    PrintType(op->dtype, os);
+    PrintType(op_ty, os);
     os << ")(" << value << ")";
   } else {
     os << value;
   }
 }
 
-void CodeGenMACA::PrintVecElemLoadExpr(DataType t, int i, const std::string& value,
+void CodeGenMACA::PrintVecElemLoadExpr(const PrimType& t, int i, const std::string& value,
                                        std::ostream& os) {
-  ICHECK_GT(t.lanes(), 1);
-  if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
+  TVM_FFI_ICHECK_GT(t.lanes(), 1);
+  if (t.bits() == 8 && IsIntOrUInt(t)) {
     if (!(t.lanes() == 2 || t.lanes() == 3)) {
       if (i != 0) {
         os << "|";
@@ -1579,7 +1667,7 @@ void CodeGenMACA::PrintVecElemLoadExpr(DataType t, int i, const std::string& val
     }
   }
 
-  if (t.is_float16()) {
+  if (IsFloat16(t)) {
     if (i == 0) {
       PrintVecConstructor(t, os);
       os << '(';
@@ -1592,7 +1680,7 @@ void CodeGenMACA::PrintVecElemLoadExpr(DataType t, int i, const std::string& val
     return;
   }
 
-  if (t.is_bfloat16()) {
+  if (IsBFloat16(t)) {
     if (i == 0) {
       PrintVecConstructor(t, os);
       os << '(';

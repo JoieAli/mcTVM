@@ -26,7 +26,7 @@
 
 #include <mcr/mc_runtime_api.h>
 // #include <mcr/mc_version.h>
-#include <tvm/runtime/packed_func.h>
+#include <tvm/ffi/function.h>
 
 #include <string>
 
@@ -39,14 +39,15 @@ namespace runtime {
   {                                                                                            \
     mcError_t result = x;                                                                      \
     if (result != mcSuccess && result != mcErrorDeinitialized) {                               \
-      LOG(FATAL) << "MACA MACA Error: " #x " failed with error: " << mcGetErrorString(result); \
+      TVM_FFI_THROW(InternalError)                                                             \
+          << "MACA MACA Error: " #x " failed with error: " << mcGetErrorString(result);        \
     }                                                                                          \
   }
 
 #define MACA_CALL(func)                                             \
   {                                                                 \
     mcError_t e = (func);                                           \
-    ICHECK(e == mcSuccess) << "MACA MACA: " << mcGetErrorString(e); \
+    TVM_FFI_ICHECK(e == mcSuccess) << "MACA MACA: " << mcGetErrorString(e); \
   }
 
 /*! \brief Thread local workspace */

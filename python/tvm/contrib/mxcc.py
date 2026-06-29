@@ -27,8 +27,7 @@ import tvm_ffi
 import tvm
 from tvm.target import Target
 
-from ..base import py_str
-from . import utils
+from tvm.support import utils
 
 
 def compile_maca(
@@ -110,7 +109,7 @@ def compile_maca(
     if proc.returncode != 0:
         msg = code
         msg += "\nCompilation error:\n"
-        msg += py_str(out)
+        msg += out.decode("utf-8", errors="replace")
         raise RuntimeError(msg)
 
     with open(file_target, "rb") as f:

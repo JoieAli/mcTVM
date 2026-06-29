@@ -21,7 +21,6 @@
  * \file maca_device_api.cc
  * \brief GPU specific API
  */
-#include <dmlc/thread_local.h>
 #include <mcc/mcc_global.h>
 #include <mcr/mc_runtime_api.h>
 #include <mxc/mxc.h>
@@ -29,7 +28,8 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/device_api.h>
-#include <tvm/runtime/profiling.h>
+#include <tvm/runtime/logging.h>
+#include <tvm/runtime/timer.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -138,17 +138,11 @@ class MACADeviceAPI final : public DeviceAPI {
       }
       case kImagePitchAlignment:
         return;
-      case kMxcArch: {
-        mcDeviceProp_t prop;
-        MACA_CALL(mcGetDeviceProperties(&prop, device.device_id));
-        *rv = prop.mxArchName;
-        return;
-      }
     }
     *rv = value;
   }
   void* AllocDataSpace(Device dev, size_t nbytes, size_t alignment, DLDataType type_hint) final {
-    ICHECK_EQ(256 % alignment, 0U) << "MACA space is aligned at 256 bytes";
+    TVM_FFI_ICHECK_EQ(256 % alignment, 0U) << "MACA space is aligned at 256 bytes";
     void* ret;
     if (dev.device_type == kDLMACAHost) {
       VLOG(1) << "allocating " << nbytes << "bytes on host";
@@ -199,7 +193,7 @@ protected:
       MACA_CALL(mcSetDevice(dev_to.device_id));
       GPUCopy(from, to, size, mcMemcpyHostToDevice, maca_stream);
     } else {
-      LOG(FATAL) << "expect copy from/to GPU or between GPU";
+      TVM_FFI_THROW(InternalError) << "expect copy from/to GPU or between GPU";
     }
   }
 
@@ -253,11 +247,12 @@ public:
   }
 };
 
-typedef dmlc::ThreadLocalStore<MACAThreadEntry> MACAThreadStore;
-
 MACAThreadEntry::MACAThreadEntry() : pool(kDLMACA, MACADeviceAPI::Global()) {}
 
-MACAThreadEntry* MACAThreadEntry::ThreadLocal() { return MACAThreadStore::Get(); }
+MACAThreadEntry* MACAThreadEntry::ThreadLocal() {
+  static thread_local MACAThreadEntry inst;
+  return &inst;
+}
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
