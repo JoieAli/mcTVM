@@ -35,8 +35,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../file_utils.h"
 #include "../../support/bytes_io.h"
+#include "../file_utils.h"
 #include "../metadata.h"
 #include "../pack_args.h"
 #include "../thread_storage_scope.h"
@@ -117,9 +117,8 @@ class MACAModuleNode : public ffi::ModuleObj {
     mcFunction_t func;
     mcError_t result = mcModuleGetFunction(&func, module_[device_id], func_name.c_str());
     if (result != mcSuccess) {
-      TVM_FFI_THROW(InternalError)
-          << "MACAError: mcModuleGetFunction " << func_name
-          << " failed with error: " << mcGetErrorString(result);
+      TVM_FFI_THROW(InternalError) << "MACAError: mcModuleGetFunction " << func_name
+                                   << " failed with error: " << mcGetErrorString(result);
     }
     return func;
   }
@@ -241,8 +240,8 @@ ffi::Module MACAModuleLoadFromBytes(const ffi::Bytes& bytes) {
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
-    .def("ffi.Module.load_from_file.maca", MACAModuleLoadFile)
-    .def("ffi.Module.load_from_bytes.maca", MACAModuleLoadFromBytes);
+      .def("ffi.Module.load_from_file.maca", MACAModuleLoadFile)
+      .def("ffi.Module.load_from_bytes.maca", MACAModuleLoadFromBytes);
 }
 }  // namespace runtime
 }  // namespace tvm

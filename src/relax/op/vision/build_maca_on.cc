@@ -23,8 +23,9 @@
  *
  * \file build_maca.cc
  */
-#include "tvm/ffi/reflection/registry.h"
 #include <tvm/runtime/logging.h>
+
+#include "tvm/ffi/reflection/registry.h"
 #if defined(__linux__)
 #include <sys/stat.h>
 #endif
@@ -161,8 +162,7 @@ ffi::Module BuildMACA(IRModule mod, Target target) {
 
   ffi::Map<GlobalVar, PrimFunc> functions;
   for (auto [gvar, base_func] : mod->functions) {
-    TVM_FFI_ICHECK(base_func->IsInstance<PrimFuncNode>())
-        << "CodeGenMACA: Can only take PrimFunc";
+    TVM_FFI_ICHECK(base_func->IsInstance<PrimFuncNode>()) << "CodeGenMACA: Can only take PrimFunc";
     auto prim_func = base_func.as_or_throw<PrimFunc>();
     CallingConv calling_conv =
         prim_func->GetAttr<CallingConv>(tvm::attr::kCallingConv, CallingConv::kDefault).value();

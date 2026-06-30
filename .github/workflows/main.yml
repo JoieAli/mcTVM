@@ -104,7 +104,7 @@ jobs:
           submodules: 'recursive'
       - name: Run MACA CI
         shell: bash -l {0}
-        run: ./tests/scripts/task_maca_ci.sh
+        run: ./tests/scripts/task_maca_ci.sh maca
         env:
           CI: "true"
           PLATFORM: gpu
