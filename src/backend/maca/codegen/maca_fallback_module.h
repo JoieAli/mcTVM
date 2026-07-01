@@ -40,9 +40,9 @@ ffi::Module MACAFallbackModuleCreate(ffi::Bytes data, ffi::String fmt,
                                      ffi::Map<ffi::String, runtime::FunctionInfo> fmap,
                                      ffi::String maca_source);
 
-inline ffi::Module MACAModuleCreateWithFallback(
-    ffi::Bytes data, ffi::String fmt, ffi::Map<ffi::String, runtime::FunctionInfo> fmap,
-    ffi::String maca_source) {
+inline ffi::Module MACAModuleCreateWithFallback(ffi::Bytes data, ffi::String fmt,
+                                                ffi::Map<ffi::String, runtime::FunctionInfo> fmap,
+                                                ffi::String maca_source) {
   if (tvm::support::GetEnv<bool>("TVM_COMPILE_FORCE_FALLBACK", false)) {
     return MACAFallbackModuleCreate(std::move(data), std::move(fmt), std::move(fmap),
                                     std::move(maca_source));

@@ -36,8 +36,7 @@ namespace target {
 class MACAFallbackModuleNode : public ffi::ModuleObj {
  public:
   MACAFallbackModuleNode(ffi::Bytes data, ffi::String fmt,
-                         ffi::Map<ffi::String, runtime::FunctionInfo> fmap,
-                         ffi::String maca_source)
+                         ffi::Map<ffi::String, runtime::FunctionInfo> fmap, ffi::String maca_source)
       : data_(std::move(data)),
         fmt_(std::move(fmt)),
         fmap_(std::move(fmap)),
