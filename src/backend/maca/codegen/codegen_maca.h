@@ -21,8 +21,8 @@
  * \file codegen_maca.h
  * \brief Utility to generate maca code
  */
-#ifndef TVM_TARGET_SOURCE_CODEGEN_MACA_H_
-#define TVM_TARGET_SOURCE_CODEGEN_MACA_H_
+#ifndef TVM_BACKEND_MACA_CODEGEN_CODEGEN_MACA_H_
+#define TVM_BACKEND_MACA_CODEGEN_CODEGEN_MACA_H_
 
 #include <tvm/ffi/error.h>
 #include <tvm/target/codegen.h>
@@ -34,7 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "codegen_c.h"
+#include "../../../target/source/codegen_c.h"
 
 namespace tvm {
 namespace codegen {
@@ -170,4 +170,4 @@ class CodeGenMACA final : public CodeGenC {
 }  // namespace codegen
 }  // namespace tvm
 
-#endif  // TVM_TARGET_SOURCE_CODEGEN_MACA_H_
+#endif  // TVM_BACKEND_MACA_CODEGEN_CODEGEN_MACA_H_

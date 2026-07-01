@@ -33,13 +33,14 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
-#include "../../support/bytes_io.h"
-#include "../file_utils.h"
-#include "../metadata.h"
-#include "../pack_args.h"
-#include "../thread_storage_scope.h"
+#include "../../../runtime/file_utils.h"
+#include "../../../runtime/metadata.h"
+#include "../../../runtime/pack_args.h"
+#include "../../../runtime/thread_storage_scope.h"
+#include "../../../support/bytes_io.h"
 #include "maca_common.h"
 
 namespace tvm {
@@ -241,7 +242,13 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def("ffi.Module.load_from_file.maca", MACAModuleLoadFile)
-      .def("ffi.Module.load_from_bytes.maca", MACAModuleLoadFromBytes);
+      .def("ffi.Module.load_from_bytes.maca", MACAModuleLoadFromBytes)
+      .def("ffi.Module.create.maca",
+           [](ffi::Bytes data, ffi::String fmt, ffi::Map<ffi::String, FunctionInfo> fmap,
+              ffi::String maca_source) {
+             return MACAModuleCreate(std::move(data), std::move(fmt), std::move(fmap),
+                                     std::move(maca_source));
+           });
 }
 }  // namespace runtime
 }  // namespace tvm

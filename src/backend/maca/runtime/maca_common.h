@@ -21,8 +21,8 @@
  * \file maca_common.h
  * \brief Common utilities for MACA
  */
-#ifndef TVM_RUNTIME_MACA_MACA_COMMON_H_
-#define TVM_RUNTIME_MACA_MACA_COMMON_H_
+#ifndef TVM_BACKEND_MACA_RUNTIME_MACA_COMMON_H_
+#define TVM_BACKEND_MACA_RUNTIME_MACA_COMMON_H_
 
 #include <mcr/mc_runtime_api.h>
 // #include <mcr/mc_version.h>
@@ -30,7 +30,7 @@
 
 #include <string>
 
-#include "../workspace_pool.h"
+#include "../../../runtime/workspace_pool.h"
 
 namespace tvm {
 namespace runtime {
@@ -64,4 +64,4 @@ class MACAThreadEntry {
 };
 }  // namespace runtime
 }  // namespace tvm
-#endif  // TVM_RUNTIME_MACA_MACA_COMMON_H_
+#endif  // TVM_BACKEND_MACA_RUNTIME_MACA_COMMON_H_

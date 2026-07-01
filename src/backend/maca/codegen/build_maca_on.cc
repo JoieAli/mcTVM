@@ -34,10 +34,9 @@
 
 #include <cstdlib>
 
-#include "../../../runtime/maca/maca_common.h"
-#include "../../../runtime/maca/maca_module.h"
 #include "../../../target/build_common.h"
-#include "../../../target/source/codegen_maca.h"
+#include "codegen_maca.h"
+#include "maca_fallback_module.h"
 
 namespace tvm {
 namespace codegen {
@@ -199,8 +198,8 @@ ffi::Module BuildMACA(IRModule mod, Target target) {
   }
   auto f_exit = ffi::Function::GetGlobal("target.TargetExitScope");
   (*f_exit)(target);
-  return MACAModuleCreate(ffi::Bytes(std::move(mcir)), ffi::String(fmt), ExtractFuncInfo(mod),
-                          ffi::String(code));
+  return ::tvm::target::MACAModuleCreateWithFallback(ffi::Bytes(std::move(mcir)), ffi::String(fmt),
+                                                     ExtractFuncInfo(mod), ffi::String(code));
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

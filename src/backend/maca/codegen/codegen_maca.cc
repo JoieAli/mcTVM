@@ -35,8 +35,8 @@
 #include <utility>
 #include <vector>
 
-#include "../../backend/cuda/codegen/literal/maca_half_t.h"
-#include "../../tirx/transform/ir_utils.h"
+#include "../../../tirx/transform/ir_utils.h"
+#include "../../cuda/codegen/literal/maca_half_t.h"
 
 namespace tvm {
 namespace codegen {
