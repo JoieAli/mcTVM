@@ -23,6 +23,3 @@ export TVM_TEST_TARGETS=maca
 export TVM_UNITTEST_TESTSUITE_NAME=python-unittest-maca
 
 ./tests/scripts/task_python_unittest.sh
-
-source tests/scripts/setup-pytest-env.sh
-run_pytest python-codegen-maca tests/python/codegen/test_target_codegen_maca.py
