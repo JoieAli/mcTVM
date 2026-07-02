@@ -101,7 +101,7 @@ jobs:
     if: ${{ github.repository == 'MetaX-MACA/mcTVM' }}
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6.0.2
         with:
           submodules: 'recursive'
       - name: Build
@@ -134,7 +134,7 @@ jobs:
       PLATFORM: cpu
       DOCKER_RUN: docker/bash.sh --env PLATFORM --env SKIP_SLOW_TESTS --env TEST_STEP_NAME
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6.0.2
         with:
           submodules: 'recursive'
       - name: Pull Image
