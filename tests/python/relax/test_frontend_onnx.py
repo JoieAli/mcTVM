@@ -815,6 +815,47 @@ def test_multi_input_broadcasting():
             )
 
 
+@pytest.mark.parametrize(
+    "op_name, dtype, shapes, values",
+    [
+        # Two rank-1 constants, the shape reported in apache/tvm#20117.
+        ("Min", TensorProto.FLOAT, [[2], [2]], [[1.0, 2.0], [3.0, 4.0]]),
+        ("Max", TensorProto.FLOAT, [[2], [2]], [[1.0, 2.0], [3.0, 4.0]]),
+        ("Sum", TensorProto.FLOAT, [[2], [2]], [[1.0, 2.0], [3.0, 4.0]]),
+        ("Mean", TensorProto.FLOAT, [[2], [2]], [[1.0, 2.0], [3.0, 4.0]]),
+        # Sum and Mean accept only floating point operands in ONNX, so the
+        # integer cases cover Min and Max. A rank-0 operand holding a valid
+        # axis index is the input that returned a wrong answer rather than
+        # raising, so it needs 0 or 1 here and not an out-of-range value.
+        ("Min", TensorProto.INT64, [[3, 2], []], [[1, 2, 3, 4, 5, 6], [0]]),
+        ("Max", TensorProto.INT64, [[3, 2], []], [[1, 2, 3, 4, 5, 6], [1]]),
+    ],
+)
+def test_multi_input_all_constant_inputs(op_name, dtype, shapes, values):
+    """Folding constant operands must match the broadcast + stack + reduce path."""
+    nodes, names = [], []
+    for i, (shape, value) in enumerate(zip(shapes, values)):
+        nodes.append(
+            helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=[f"c{i}"],
+                value=helper.make_tensor(f"c{i}_v", dtype, shape, value),
+            )
+        )
+        names.append(f"c{i}")
+
+    nodes.append(helper.make_node(op_name, names, ["output"]))
+    output_shape = list(np.broadcast_shapes(*[tuple(shape) for shape in shapes]))
+    graph = helper.make_graph(
+        nodes,
+        f"all_constant_{op_name}",
+        inputs=[],
+        outputs=[helper.make_tensor_value_info("output", dtype, output_shape)],
+    )
+    check_correctness(helper.make_model(graph), opset=13)
+
+
 @pytest.mark.parametrize("op_name", ["And", "Or", "Xor"])
 def test_binary_bool(op_name: str):
     verify_binary(op_name, [32, 32], [32, 32], [32, 32], dtype=TensorProto.BOOL)
@@ -3455,20 +3496,34 @@ def test_mish():
 
 
 def test_prelu():
-    def _assert_prelu_ir(slope_shape, expected):
+    def _assert_prelu_ir(slope_shape, expected, input_shape=(3, 32, 32)):
         prelu_node = helper.make_node("PRelu", ["a", "b"], ["c"])
         graph = helper.make_graph(
             [prelu_node],
             "prelu_structural_test",
             inputs=[
-                helper.make_tensor_value_info("a", TensorProto.FLOAT, [3, 32, 32]),
+                helper.make_tensor_value_info("a", TensorProto.FLOAT, input_shape),
                 helper.make_tensor_value_info("b", TensorProto.FLOAT, slope_shape),
             ],
-            outputs=[helper.make_tensor_value_info("c", TensorProto.FLOAT, [3, 32, 32])],
+            outputs=[helper.make_tensor_value_info("c", TensorProto.FLOAT, input_shape)],
         )
         model = helper.make_model(graph, producer_name="prelu_structural_test")
         tvm_model = from_onnx(model, keep_params_in_input=True)
         tvm.ir.assert_structural_equal(tvm_model, expected)
+
+    @I.ir_module
+    class ExpectedRankZeroSlope:
+        @R.function
+        def main(
+            a: R.Tensor((3, 32, 32), dtype="float32"),
+            b: R.Tensor((), dtype="float32"),
+        ) -> R.Tensor((3, 32, 32), dtype="float32"):
+            R.func_attr({"num_input": 2})
+            with R.dataflow():
+                lv: R.Tensor((1,), dtype="float32") = R.reshape(b, R.shape([1]))
+                gv: R.Tensor((3, 32, 32), dtype="float32") = R.nn.prelu(a, lv, axis=2)
+                R.output(gv)
+            return gv
 
     @I.ir_module
     class ExpectedScalarSlope:
@@ -3526,10 +3581,50 @@ def test_prelu():
                 R.output(gv)
             return gv
 
+    @I.ir_module
+    class ExpectedLowerRankChannelSlope:
+        @R.function
+        def main(
+            a: R.Tensor((1, 32, 16, 16), dtype="float32"),
+            b: R.Tensor((32, 1, 1), dtype="float32"),
+        ) -> R.Tensor((1, 32, 16, 16), dtype="float32"):
+            R.func_attr({"num_input": 2})
+            with R.dataflow():
+                lv: R.Tensor((32,), dtype="float32") = R.reshape(b, R.shape([32]))
+                gv: R.Tensor((1, 32, 16, 16), dtype="float32") = R.nn.prelu(a, lv, axis=1)
+                R.output(gv)
+            return gv
+
+    _assert_prelu_ir([], ExpectedRankZeroSlope)
     _assert_prelu_ir([1], ExpectedScalarSlope)
     _assert_prelu_ir([1, 1], ExpectedTwoDimScalarSlope)
     _assert_prelu_ir([32], ExpectedChannelSlope)
     _assert_prelu_ir([3, 1, 1], ExpectedBatchSlope)
+    _assert_prelu_ir([32, 1, 1], ExpectedLowerRankChannelSlope, input_shape=(1, 32, 16, 16))
+
+
+def test_prelu_lower_rank_slope():
+    input_shape = (1, 4, 3, 3)
+    slope_shape = (4, 1, 1)
+    graph = helper.make_graph(
+        [helper.make_node("PRelu", ["x", "slope"], ["y"])],
+        "prelu_lower_rank_slope_test",
+        inputs=[
+            helper.make_tensor_value_info("x", TensorProto.FLOAT, input_shape),
+            helper.make_tensor_value_info("slope", TensorProto.FLOAT, slope_shape),
+        ],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, input_shape)],
+    )
+    model = helper.make_model(
+        graph,
+        producer_name="prelu_lower_rank_slope_test",
+        opset_imports=[helper.make_opsetid("", 16)],
+    )
+    inputs = {
+        "x": np.linspace(-2.0, 2.0, np.prod(input_shape), dtype="float32").reshape(input_shape),
+        "slope": np.array([0.1, 0.2, 0.3, 0.4], dtype="float32").reshape(slope_shape),
+    }
+    check_correctness(model, inputs=inputs, opset=16, check_dtypes=True)
 
 
 def test_thresholded_relu():
@@ -12379,6 +12474,30 @@ def test_dequantizelinear_singleton_qparams_opset10():
 
     x = rg.integers(low=0, high=255, size=(64,), dtype=np.uint8)
     check_correctness(model, inputs={"x": x}, opset=10, check_dtypes=True)
+
+
+@pytest.mark.parametrize(
+    ("op_type", "input_dtype", "output_dtype", "input_value"),
+    [
+        ("QuantizeLinear", TensorProto.FLOAT, TensorProto.UINT8, np.array(1.25, "float32")),
+        ("DequantizeLinear", TensorProto.UINT8, TensorProto.FLOAT, np.array(7, "uint8")),
+    ],
+)
+def test_qdqlinear_scalar_input(op_type, input_dtype, output_dtype, input_value):
+    node = helper.make_node(op_type, ["x", "scale", "zero_point"], ["y"])
+    graph = helper.make_graph(
+        [node],
+        f"{op_type.lower()}_scalar_input",
+        [helper.make_tensor_value_info("x", input_dtype, [])],
+        [helper.make_tensor_value_info("y", output_dtype, [])],
+        initializer=[
+            helper.make_tensor("scale", TensorProto.FLOAT, [], [0.25]),
+            helper.make_tensor("zero_point", TensorProto.UINT8, [], [2]),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+
+    check_correctness(model, inputs={"x": input_value}, opset=18, check_dtypes=True)
 
 
 def test_quantizelinear_optional_zero_point_opset13():

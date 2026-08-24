@@ -31,7 +31,10 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <limits>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -46,6 +49,26 @@
 
 namespace tvm {
 namespace codegen {
+
+namespace {
+
+size_t GetWgslArrayElementStride(const PrimType& dtype) {
+  if (dtype == PrimType::Bool()) {
+    return 4;
+  }
+
+  int lanes = dtype.lanes();
+  if (dtype.MatchesCode(DLDataTypeCode::kDLInt) && dtype.bits() == 8 && lanes == 4) {
+    return 4;
+  }
+
+  size_t scalar_bytes = (dtype.bits() + 7) / 8;
+  // WGSL arrays use the alignment-rounded size as their element stride.  In
+  // particular, a three-lane vector has the same stride as a four-lane vector.
+  return scalar_bytes * (lanes == 3 ? 4 : lanes);
+}
+
+}  // namespace
 
 // WebGPU Info
 struct WebGPUWorkGroupInfo {
@@ -67,6 +90,22 @@ class WebGPUWorkgroupInfoCollector : public StmtExprVisitor {
  private:
   using StmtExprVisitor::VisitExpr_;
 
+  static ffi::Optional<Var> GetBufferDataVar(const Expr& data) {
+    if (auto var = data.as<Var>()) {
+      return var;
+    }
+    if (const auto* call = data.as<CallNode>();
+        call && call->op.same_as(tirx::builtin::buffer_data()) && call->args.size() == 1) {
+      return call->args[0].as<Var>();
+    }
+    return std::nullopt;
+  }
+
+  Var ResolveBuffer(Var buffer_var) const {
+    auto it = buffer_aliases_.find(buffer_var.get());
+    return it == buffer_aliases_.end() ? buffer_var : it->second;
+  }
+
   void VisitExpr_(const VarNode* op) final {
     StmtExprVisitor::VisitExpr_(op);
     Var buffer_var = ffi::GetRef<Var>(op);
@@ -77,7 +116,15 @@ class WebGPUWorkgroupInfoCollector : public StmtExprVisitor {
 
   void VisitStmt_(const BufferStoreNode* op) final {
     StmtExprVisitor::VisitStmt_(op);
-    info_.write_access_set.insert(op->buffer.var());
+    info_.write_access_set.insert(ResolveBuffer(op->buffer.var()));
+  }
+
+  void VisitStmt_(const DeclBufferNode* op) final {
+    if (auto source = GetBufferDataVar(op->data)) {
+      buffer_aliases_.insert_or_assign(op->buffer.get(), ResolveBuffer(source.value()));
+      return;
+    }
+    StmtExprVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const AttrStmtNode* op) final {
@@ -104,6 +151,7 @@ class WebGPUWorkgroupInfoCollector : public StmtExprVisitor {
     StmtExprVisitor::VisitStmt_(op);
   }
   WebGPUWorkGroupInfo info_;
+  std::unordered_map<const VarNode*, Var> buffer_aliases_;
 };
 
 std::string CodeGenWebGPU::Finish() {
@@ -119,6 +167,7 @@ std::string CodeGenWebGPU::Finish() {
 
 void CodeGenWebGPU::InitFuncState(const PrimFunc& f) {
   CodeGenC::InitFuncState(f);
+  workgroup_memory_bytes_ = 0;
   // analyze the data;
   for (Var arg : f->params) {
     if (arg->ty.as<PointerTypeNode>()) {
@@ -669,15 +718,50 @@ void CodeGenWebGPU::VisitStmt_(const AllocBufferNode* op) {
   TVM_FFI_ICHECK(op->buffer.defined());
   std::string vid = AllocVarID(op->buffer.get());
   size_t constant_size = 1;
+  arith::Analyzer analyzer;
   for (const auto& dim : op->buffer->shape) {
-    const IntImmNode* dim_imm = dim.as<IntImmNode>();
-    TVM_FFI_ICHECK(dim_imm) << "Can only handle constant size stack allocation for now";
-    constant_size *= dim_imm->value;
+    const auto* dim_imm = dim.as<IntImmNode>();
+    int64_t dim_size = dim_imm ? dim_imm->value : analyzer->const_int_bound(dim)->max_value;
+    if (dim_imm == nullptr) {
+      const auto* dtype_max = max_value(dim.ty()).as<IntImmNode>();
+      // An integer dtype's intrinsic maximum is not a program-derived allocation bound.
+      TVM_FFI_ICHECK(dtype_max && dim_size < dtype_max->value)
+          << "WebGPU allocation extent requires a finite compile-time upper bound, but got " << dim;
+    }
+    TVM_FFI_ICHECK_GT(dim_size, 0)
+        << "WebGPU allocation extent requires a positive compile-time upper bound, but got " << dim;
+    TVM_FFI_ICHECK_LE(static_cast<uint64_t>(dim_size),
+                      std::numeric_limits<size_t>::max() / constant_size)
+        << "WebGPU allocation element count is too large to represent";
+    constant_size *= static_cast<size_t>(dim_size);
   }
-  TVM_FFI_ICHECK_GT(constant_size, 0) << "Can only handle constant size stack allocation for now";
+
+  size_t element_stride = GetWgslArrayElementStride(op->buffer->dtype);
+  TVM_FFI_ICHECK_LE(constant_size, std::numeric_limits<size_t>::max() / element_stride)
+      << "WebGPU allocation byte size is too large to represent";
+  size_t allocation_bytes = constant_size * element_stride;
   auto storage_scope = runtime::StorageScope::Create(op->buffer.scope());
 
   if (storage_scope.rank == runtime::StorageRank::kShared) {
+    // WebGPU rounds the size of each workgroup variable up to 16 bytes before
+    // summing the storage used by an entry point.
+    constexpr size_t kWorkgroupVariableAlignment = 16;
+    TVM_FFI_ICHECK_LE(allocation_bytes,
+                      std::numeric_limits<size_t>::max() - (kWorkgroupVariableAlignment - 1))
+        << "WebGPU workgroup allocation size is too large to represent";
+    size_t workgroup_variable_bytes =
+        (allocation_bytes + kWorkgroupVariableAlignment - 1) & ~(kWorkgroupVariableAlignment - 1);
+    TVM_FFI_ICHECK_LE(workgroup_variable_bytes,
+                      std::numeric_limits<size_t>::max() - workgroup_memory_bytes_)
+        << "Total WebGPU workgroup allocation size is too large to represent";
+    workgroup_memory_bytes_ += workgroup_variable_bytes;
+    int64_t limit = target_->GetAttr<int64_t>("max_shared_memory_per_block").value();
+    TVM_FFI_ICHECK_GT(limit, 0) << "WebGPU max_shared_memory_per_block must be positive";
+    TVM_FFI_ICHECK_LE(workgroup_memory_bytes_, static_cast<uint64_t>(limit))
+        << "WebGPU workgroup allocations use " << workgroup_memory_bytes_
+        << " bytes, but the target supports only " << limit
+        << " bytes. If the adapter supports this allocation, set "
+           "max_shared_memory_per_block in the WebGPU target configuration.";
     this->decl_stream << "var<workgroup> " << vid << " : array<";
     PrintType(op->buffer->dtype, this->decl_stream);
     this->decl_stream << ", " << constant_size << ">;\n";
