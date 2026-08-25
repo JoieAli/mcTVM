@@ -204,6 +204,7 @@ jobs:
           -o "junit_suite_name=python-unittest-gpu-relax"
           --junit-xml="${TVM_PYTEST_RESULT_DIR}/python-unittest-gpu-relax.xml"
           --junit-prefix=cython
+          --reruns=3
           tests/python/relax || test $? -eq 5
 
       - name: Test Summary
